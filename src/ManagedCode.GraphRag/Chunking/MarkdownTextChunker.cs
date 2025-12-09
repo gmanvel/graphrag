@@ -44,6 +44,46 @@ public sealed class MarkdownTextChunker : ITextChunker
         return results;
     }
 
+    /// <summary>
+    /// Optimized version of Chunk - uses optimized method chain for A/B benchmarking.
+    /// </summary>
+    public IReadOnlyList<TextChunk> ChunkOptimized(IReadOnlyList<ChunkSlice> slices, ChunkingConfig config)
+    {
+        ArgumentNullException.ThrowIfNull(slices);
+        ArgumentNullException.ThrowIfNull(config);
+
+        if (slices.Count == 0)
+        {
+            return [];
+        }
+
+        var tokenizer = TokenizerRegistry.GetTokenizer(config.EncodingModel);
+        var options = new MarkdownChunkerOptions
+        {
+            MaxTokensPerChunk = Math.Max(MinChunkSize, config.Size),
+            Overlap = Math.Max(0, config.Overlap)
+        };
+
+        var results = new List<TextChunk>();
+
+        foreach (var slice in slices)
+        {
+            var fragments = SplitOptimized(slice.Text, options, tokenizer);
+            foreach (var fragment in fragments)
+            {
+                var tokens = tokenizer.EncodeToIds(fragment);
+                if (tokens.Count == 0)
+                {
+                    continue;
+                }
+
+                results.Add(new TextChunk([slice.DocumentId], fragment, tokens.Count));
+            }
+        }
+
+        return results;
+    }
+
     private List<string> Split(string text, MarkdownChunkerOptions options, Tokenizer tokenizer)
     {
         text = NormalizeNewlines(text);
@@ -210,7 +250,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         return chunks;
     }
 
-    private static List<Fragment> SplitToFragments(string text, SeparatorTrie? separators)
+    internal static List<Fragment> SplitToFragments(string text, SeparatorTrie? separators)
     {
         if (separators is null)
         {
@@ -256,7 +296,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         return fragments;
     }
 
-    private static List<string> MergeImageChunks(List<string> chunks)
+    internal static List<string> MergeImageChunks(List<string> chunks)
     {
         if (chunks.Count <= 1)
         {
@@ -312,11 +352,275 @@ public sealed class MarkdownTextChunker : ITextChunker
         _ => SeparatorType.NotASeparator
     };
 
-    private static string NormalizeNewlines(string input) => input.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+    internal static string NormalizeNewlines(string input) => input.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+
+    #region Optimized Methods (exact clones for A/B benchmarking)
+
+    private List<string> SplitOptimized(string text, MarkdownChunkerOptions options, Tokenizer tokenizer)
+    {
+        text = NormalizeNewlinesOptimized(text);
+        var firstChunkDone = false;
+        var primarySize = options.MaxTokensPerChunk;
+        var secondarySize = Math.Max(MinChunkSize, options.MaxTokensPerChunk - options.Overlap);
+
+        var rawChunks = RecursiveSplitOptimized(text, primarySize, secondarySize, SeparatorType.ExplicitSeparator, tokenizer, ref firstChunkDone);
+
+        if (options.Overlap > 0 && rawChunks.Count > 1)
+        {
+            var newChunks = new List<string> { rawChunks[0] };
+
+            for (var index = 1; index < rawChunks.Count; index++)
+            {
+                var previousTokens = tokenizer.EncodeToIds(rawChunks[index - 1]);
+                var overlapTokens = previousTokens.Skip(Math.Max(0, previousTokens.Count - options.Overlap)).ToArray();
+                var overlapText = tokenizer.Decode(overlapTokens);
+                newChunks.Add(string.Concat(overlapText, rawChunks[index]));
+            }
+
+            rawChunks = newChunks;
+        }
+
+        return MergeImageChunksOptimized(rawChunks);
+    }
+
+    private List<string> RecursiveSplitOptimized(
+        string text,
+        int maxChunk1Size,
+        int maxChunkNSize,
+        SeparatorType separatorType,
+        Tokenizer tokenizer,
+        ref bool firstChunkDone)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+        {
+            return [];
+        }
+
+        var maxChunkSize = firstChunkDone ? maxChunkNSize : maxChunk1Size;
+        if (tokenizer.CountTokens(text) <= maxChunkSize)
+        {
+            return [text];
+        }
+
+        var fragments = separatorType switch
+        {
+            SeparatorType.ExplicitSeparator => SplitToFragmentsOptimized(text, ExplicitSeparators),
+            SeparatorType.PotentialSeparator => SplitToFragmentsOptimized(text, PotentialSeparators),
+            SeparatorType.WeakSeparator1 => SplitToFragmentsOptimized(text, WeakSeparators1),
+            SeparatorType.WeakSeparator2 => SplitToFragmentsOptimized(text, WeakSeparators2),
+            SeparatorType.WeakSeparator3 => SplitToFragmentsOptimized(text, WeakSeparators3),
+            SeparatorType.NotASeparator => SplitToFragmentsOptimized(text, null),
+            _ => throw new ArgumentOutOfRangeException(nameof(separatorType), separatorType, null)
+        };
+
+        return GenerateChunksOptimized(fragments, maxChunk1Size, maxChunkNSize, separatorType, tokenizer, ref firstChunkDone);
+    }
+
+    private List<string> GenerateChunksOptimized(
+        List<Fragment> fragments,
+        int maxChunk1Size,
+        int maxChunkNSize,
+        SeparatorType separatorType,
+        Tokenizer tokenizer,
+        ref bool firstChunkDone)
+    {
+        if (fragments.Count == 0)
+        {
+            return [];
+        }
+
+        var chunks = new List<string>();
+        var builder = new ChunkBuilder();
+
+        foreach (var fragment in fragments)
+        {
+            builder.NextSentence.Append(fragment.Content);
+
+            if (!fragment.IsSeparator)
+            {
+                continue;
+            }
+
+            var nextSentence = builder.NextSentence.ToString();
+            var nextSentenceSize = tokenizer.CountTokens(nextSentence);
+            var maxChunkSize = firstChunkDone ? maxChunkNSize : maxChunk1Size;
+            var chunkEmpty = builder.FullContent.Length == 0;
+            var sentenceTooLong = nextSentenceSize > maxChunkSize;
+
+            if (chunkEmpty && !sentenceTooLong)
+            {
+                builder.FullContent.Append(nextSentence);
+                builder.NextSentence.Clear();
+                continue;
+            }
+
+            if (chunkEmpty)
+            {
+                var moreChunks = RecursiveSplitOptimized(nextSentence, maxChunk1Size, maxChunkNSize, NextSeparatorType(separatorType), tokenizer, ref firstChunkDone);
+                chunks.AddRange(moreChunks.Take(moreChunks.Count - 1));
+                builder.NextSentence.Clear().Append(moreChunks.Last());
+                continue;
+            }
+
+            var chunkPlusSentence = builder.FullContent.ToString() + builder.NextSentence;
+            if (!sentenceTooLong && tokenizer.CountTokens(chunkPlusSentence) <= maxChunkSize)
+            {
+                builder.FullContent.Append(builder.NextSentence);
+                builder.NextSentence.Clear();
+                continue;
+            }
+
+            AddChunkOptimized(chunks, builder.FullContent, ref firstChunkDone);
+
+            if (sentenceTooLong)
+            {
+                var moreChunks = RecursiveSplitOptimized(nextSentence, maxChunk1Size, maxChunkNSize, NextSeparatorType(separatorType), tokenizer, ref firstChunkDone);
+                chunks.AddRange(moreChunks.Take(moreChunks.Count - 1));
+                builder.NextSentence.Clear().Append(moreChunks.Last());
+            }
+            else
+            {
+                builder.FullContent.Clear().Append(builder.NextSentence);
+                builder.NextSentence.Clear();
+            }
+        }
+
+        var fullSentenceLeft = builder.FullContent.ToString();
+        var nextSentenceLeft = builder.NextSentence.ToString();
+        var remainingMax = firstChunkDone ? maxChunkNSize : maxChunk1Size;
+
+        if (tokenizer.CountTokens(fullSentenceLeft + nextSentenceLeft) <= remainingMax)
+        {
+            if (fullSentenceLeft.Length > 0 || nextSentenceLeft.Length > 0)
+            {
+                AddChunkOptimized(chunks, fullSentenceLeft + nextSentenceLeft, ref firstChunkDone);
+            }
+
+            return chunks;
+        }
+
+        if (fullSentenceLeft.Length > 0)
+        {
+            AddChunkOptimized(chunks, fullSentenceLeft, ref firstChunkDone);
+        }
+
+        if (nextSentenceLeft.Length == 0)
+        {
+            return chunks;
+        }
+
+        if (tokenizer.CountTokens(nextSentenceLeft) <= remainingMax)
+        {
+            AddChunkOptimized(chunks, nextSentenceLeft, ref firstChunkDone);
+        }
+        else
+        {
+            var moreChunks = RecursiveSplitOptimized(nextSentenceLeft, maxChunk1Size, maxChunkNSize, NextSeparatorType(separatorType), tokenizer, ref firstChunkDone);
+            chunks.AddRange(moreChunks);
+        }
+
+        return chunks;
+    }
+
+    internal static List<Fragment> SplitToFragmentsOptimized(string text, SeparatorTrie? separators)
+    {
+        if (separators is null)
+        {
+            return text.Select(ch => new Fragment(ch.ToString(), true)).ToList();
+        }
+
+        if (text.Length == 0 || separators.Length == 0)
+        {
+            return [];
+        }
+
+        var fragments = new List<Fragment>();
+        var fragmentBuilder = new StringBuilder();
+        var index = 0;
+
+        while (index < text.Length)
+        {
+            var found = separators.MatchLongest(text, index);
+
+            if (found is not null)
+            {
+                if (fragmentBuilder.Length > 0)
+                {
+                    fragments.Add(new Fragment(fragmentBuilder.ToString(), false));
+                    fragmentBuilder.Clear();
+                }
+
+                fragments.Add(new Fragment(found, true));
+                index += found.Length;
+            }
+            else
+            {
+                fragmentBuilder.Append(text[index]);
+                index++;
+            }
+        }
+
+        if (fragmentBuilder.Length > 0)
+        {
+            fragments.Add(new Fragment(fragmentBuilder.ToString(), false));
+        }
+
+        return fragments;
+    }
+
+    internal static List<string> MergeImageChunksOptimized(List<string> chunks)
+    {
+        if (chunks.Count <= 1)
+        {
+            return chunks;
+        }
+
+        var merged = new List<string>();
+
+        foreach (var chunk in chunks)
+        {
+            var trimmed = chunk.TrimStart();
+            if (trimmed.StartsWith("![", StringComparison.Ordinal) && merged.Count > 0)
+            {
+                merged[^1] = string.Concat(merged[^1].TrimEnd(), "\n\n", chunk.TrimStart());
+            }
+            else
+            {
+                merged.Add(chunk);
+            }
+        }
+
+        return merged;
+    }
+
+    private static void AddChunkOptimized(List<string> chunks, StringBuilder builder, ref bool firstChunkDone)
+    {
+        var chunk = builder.ToString();
+        if (!string.IsNullOrWhiteSpace(chunk))
+        {
+            chunks.Add(chunk);
+            firstChunkDone = true;
+        }
+
+        builder.Clear();
+    }
+
+    private static void AddChunkOptimized(List<string> chunks, string chunk, ref bool firstChunkDone)
+    {
+        if (!string.IsNullOrWhiteSpace(chunk))
+        {
+            chunks.Add(chunk);
+            firstChunkDone = true;
+        }
+    }
+
+    internal static string NormalizeNewlinesOptimized(string input) => input.Replace("\r\n", "\n", StringComparison.Ordinal).Replace('\r', '\n');
+
+    #endregion
 
     private const int MinChunkSize = 5;
 
-    private static readonly SeparatorTrie ExplicitSeparators = new([
+    internal static readonly SeparatorTrie ExplicitSeparators = new([
         ".\n\n",
         "!\n\n",
         "!!\n\n",
@@ -333,7 +637,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         "\n---"
     ]);
 
-    private static readonly SeparatorTrie PotentialSeparators = new([
+    internal static readonly SeparatorTrie PotentialSeparators = new([
         "\n> ",
         "\n>- ",
         "\n>* ",
@@ -350,7 +654,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         "\n```"
     ]);
 
-    private static readonly SeparatorTrie WeakSeparators1 = new([
+    internal static readonly SeparatorTrie WeakSeparators1 = new([
         "![",
         "[",
         "| ",
@@ -359,7 +663,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         "\n: "
     ]);
 
-    private static readonly SeparatorTrie WeakSeparators2 = new([
+    internal static readonly SeparatorTrie WeakSeparators2 = new([
         ". ", ".\t", ".\n",
         "? ", "?\t", "?\n",
         "! ", "!\t", "!\n",
@@ -371,7 +675,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         ".", "?", "!", "⁉", "⁈", "⁇", "…"
     ]);
 
-    private static readonly SeparatorTrie WeakSeparators3 = new([
+    internal static readonly SeparatorTrie WeakSeparators3 = new([
         "; ", ";\t", ";\n", ";",
         "} ", "}\t", "}\n", "}",
         ") ", ")\t", ")\n",
@@ -392,7 +696,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         NotASeparator
     }
 
-    private sealed record Fragment(string Content, bool IsSeparator);
+    internal sealed record Fragment(string Content, bool IsSeparator);
 
     private sealed class ChunkBuilder
     {
@@ -406,7 +710,7 @@ public sealed class MarkdownTextChunker : ITextChunker
         public int Overlap { get; init; }
     }
 
-    private sealed class SeparatorTrie
+    internal sealed class SeparatorTrie
     {
         private readonly Dictionary<char, List<string>> _lookup = new();
 

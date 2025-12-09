@@ -36,10 +36,16 @@ public class MarkdownTextChunkerBenchmarks
         _largeDocument = new[] { new ChunkSlice("doc1", GenerateMarkdownDocument(1_000_000)) };
     }
 
-    [Benchmark]
+    [Benchmark(Baseline = true)]
     public IReadOnlyList<TextChunk> ChunkSmallDocument()
     {
         return _chunker.Chunk(_smallDocument, _config);
+    }
+
+    [Benchmark]
+    public IReadOnlyList<TextChunk> ChunkSmallDocumentOptimized()
+    {
+        return _chunker.ChunkOptimized(_smallDocument, _config);
     }
 
     [Benchmark]
@@ -49,9 +55,21 @@ public class MarkdownTextChunkerBenchmarks
     }
 
     [Benchmark]
+    public IReadOnlyList<TextChunk> ChunkMediumDocumentOptimized()
+    {
+        return _chunker.ChunkOptimized(_mediumDocument, _config);
+    }
+
+    [Benchmark]
     public IReadOnlyList<TextChunk> ChunkLargeDocument()
     {
         return _chunker.Chunk(_largeDocument, _config);
+    }
+
+    [Benchmark]
+    public IReadOnlyList<TextChunk> ChunkLargeDocumentOptimized()
+    {
+        return _chunker.ChunkOptimized(_largeDocument, _config);
     }
 
     private static string GenerateMarkdownDocument(int approximateLength)
