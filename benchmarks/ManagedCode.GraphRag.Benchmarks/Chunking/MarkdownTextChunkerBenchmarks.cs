@@ -1,10 +1,15 @@
 using BenchmarkDotNet.Attributes;
+using BenchmarkDotNet.Diagnostics.dotMemory;
+using BenchmarkDotNet.Diagnostics.dotTrace;
 using GraphRag.Chunking;
 using GraphRag.Config;
 
 namespace ManagedCode.GraphRag.Benchmarks.Chunking;
 
 [MemoryDiagnoser]
+[HideColumns("Error", "StdDev", "RatioSD")]
+//[DotTraceDiagnoser]
+[DotMemoryDiagnoser]
 public class MarkdownTextChunkerBenchmarks
 {
     private MarkdownTextChunker _chunker = null!;
@@ -13,7 +18,8 @@ public class MarkdownTextChunkerBenchmarks
     private ChunkSlice[] _largeDocument = null!;
     private ChunkingConfig _config = null!;
 
-    [Params(512, 1024, 2048)]
+    //[Params(512, 1024, 2048)]
+    [Params(1024)]
     public int ChunkSize { get; set; }
 
     [Params(0, 64, 128)]
